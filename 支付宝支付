@@ -1,0 +1,114 @@
+我们集成支付宝支付 也就需要提供两个接口出来.一个是给前端 作用是拿到请求参数加签返回给前端
+前端拿到我们返回的数据.进行调起支付就行了,第二个接口是提供给支付宝的服务器,支付成功或者失败的时候.支付宝的服务器会回调我们的这个接口.异步通知我们支付结果
+服务端sdk地址:https://doc.open.alipay.com/doc2/detail?treeId=54&articleId=103419&docType=1
+前端集成地址:https://doc.open.alipay.com/docs/doc.htm?spm=a219a.7629140.0.0.HwBhZv&treeId=193&articleId=105296&docType=1
+公钥 私钥 生成地址:https://doc.open.alipay.com/docs/doc.htm?spm=a219a.7629140.0.0.STtXnL&treeId=193&articleId=105310&docType=1
+好了.废话不哆嗦,直接上代码:(此时,公钥 私钥环境都已经配好)
+
+@RestController  
+@RequestMapping("/payment")  
+public class PaymentController {  
+    // 支付宝重要参数  
+    private static String APP_ID = "";  
+    private static String APP_PRIVATE_KEY = "";  
+    private static String CHARSET = "utf-8";  
+    private static String ALIPAY_PUBLIC_KEY = "";  
+  
+    /** 
+     * 对支付宝支付信息进行签名 
+     *  
+     * @param info 
+     *            数据类 
+     * @return 
+     * @throws AlipayApiException 
+     * @throws UnsupportedEncodingException 
+     */  
+    @PostMapping("/sign")  
+    public Object sign(@RequestBody SignInfo info) throws AlipayApiException, UnsupportedEncodingException {  
+        SimpleDateFormat sdf = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss");  
+        String appID = APP_ID;  
+        String bizContent = toJson(info.Content);  
+        String charset = CHARSET;  
+        String method = "alipay.trade.app.pay";  
+        String signType = "RSA";  
+        String timestamp = sdf.format(new Date());  
+        String version = "1.0";  
+        String notify_url = "https://pay.ytbapp.com/payment/notify";// 增加支付异步通知回调,记住上下notify_url的位置,全在sign_type之前,很重要,同样放在最后都不行  
+        String content = "app_id=" + appID + "&biz_content=" + bizContent + "&charset=" + charset + "&method=" + method  
+                + "¬ify_url=" + (notify_url) + "&sign_type=" + signType + "×tamp=" + timestamp + "&version="  
+                + version;  
+  
+        String sign = AlipaySignature.rsaSign(content, APP_PRIVATE_KEY, charset);  
+  
+        return "{\"Result\": \"app_id=" + encode(appID) + "&biz_content=" + encode(bizContent) + "&charset="  
+                + encode(charset) + "&method=" + encode(method) + "¬ify_url=" + encode(notify_url) + "&sign_type="  
+                + encode(signType) + "×tamp=" + encode(timestamp) + "&version=" + encode(version) + "&sign="  
+                + encode(sign) + "\"}";  
+    }  
+  
+    private String encode(String sign) throws UnsupportedEncodingException {  
+        return URLEncoder.encode(sign, "utf-8").replace("+", "%20");  
+    }  
+  
+    private String toJson(BizContent content) {  
+        String context = "";  
+        context += "{" + "\"timeout_express\":\"" + content.timeout_express + "\"," + "\"seller_id\":\""  
+                + content.seller_id + "\"," + "\"product_code\":\"" + content.product_code + "\","  
+                + "\"total_amount\":\"" + content.total_amount + "\"," + "\"subject\":\"" + content.subject + "\","  
+                + "\"body\":\"" + content.body + "\"," + "\"out_trade_no\":\"" + content.out_trade_no + "\"}";  
+  
+        return context;  
+    }  
+  
+    /** 
+     * 支付宝支付成功后.会回调该接口 
+     *  
+     * @param request 
+     * @return 
+     * @throws UnsupportedEncodingException 
+     */  
+    @PostMapping("/notify")  
+    public String notify(HttpServletRequest request) throws UnsupportedEncodingException {  
+        Map<String, String> params = new HashMap<String, String>();  
+        Map<String, String[]> requestParams = request.getParameterMap();  
+        for (Iterator<String> iter = requestParams.keySet().iterator(); iter.hasNext();) {  
+            String name = iter.next();  
+            String[] values = requestParams.get(name);  
+            String valueStr = "";  
+            for (int i = 0; i < values.length; i++) {  
+                valueStr = (i == values.length - 1) ? valueStr + values[i] : valueStr + values[i] + ",";  
+            }  
+            // 乱码解决，这段代码在出现乱码时使用。如果mysign和sign不相等也可以使用这段代码转化  
+            // valueStr = new String(valueStr.getBytes("ISO-8859-1"), "gbk");  
+            params.put(name, valueStr);  
+        }  
+        String out_trade_no = request.getParameter("out_trade_no");// 商户订单号  
+        boolean signVerified = false;  
+        try {  
+            signVerified = AlipaySignature.rsaCheckV1(params, ALIPAY_PUBLIC_KEY, CHARSET);  
+        } catch (AlipayApiException e) {  
+            // TODO Auto-generated catch block  
+            e.printStackTrace();  
+            return ("fail");// 验签发生异常,则直接返回失败  
+        }  
+        // 调用SDK验证签名  
+        if (signVerified) {  
+            // TODO 验签成功后  
+            // 按照支付结果异步通知中的描述，对支付结果中的业务内容进行1\2\3\4二次校验，校验成功后在response中返回success，校验失败返回failure  
+            String result = updateALiPayOrderStatus(out_trade_no);  
+            System.out.println("验证成功,去更新状态 \t订单号:" + out_trade_no + "来自支付宝支付,更新结果:" + result);  
+            BaseResponse baseResponse = GsonUtils.getGson().fromJson(result, BaseResponse.class);  
+            if (null != baseResponse && baseResponse.isSucceeded) {  
+                return ("success");  
+            } else {  
+                return ("fail");// 更新状态失败  
+            }  
+        } else {  
+            // TODO 验签失败则记录异常日志，并在response中返回failure.  
+            System.out.println("验证失败,不去更新状态");  
+            return ("fail");  
+        }  
+    }  
+}  
+
+
