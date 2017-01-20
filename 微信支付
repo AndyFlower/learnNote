@@ -1,0 +1,215 @@
+@RestController  
+@RequestMapping("/wxpayment")  
+public class WxPaymentController {  
+    public static final String WXUNIFIEDORDER_HTTPURL = "https://api.mch.weixin.qq.com/pay/unifiedorder";// 微信统一下单接口  
+    public static final String APP_ID = "";// 微信appid  
+    public static final String MCH_ID = "";// 商户号  
+    public static final String API_KEY = "";// apikey  
+  
+    /** 
+     * 对微信支付信息进行签名 
+     *  
+     * @param info 
+     *            数据类 
+     * @return 
+     * @throws AlipayApiException 
+     * @throws UnsupportedEncodingException 
+     */  
+    @PostMapping("/sign")  
+    public Object sign(@RequestBody WXSignInfo wxSignInfo, HttpServletRequest httpServletRequest)  
+            throws AlipayApiException, UnsupportedEncodingException {  
+        String create_ip = NetStateUtils.getIpAddr(httpServletRequest);  
+        ResponseWxSign4App response = new ResponseWxSign4App();  
+        response.setResult(wxUnifiedorder(create_ip, wxSignInfo.Content));  
+        String result = GsonUtils.object2Json(response);  
+        System.out.println("微信支付 加签结果:" + result);  
+        return result;  
+    }  
+  
+    /** 
+     * 微信支付成功后.微信服务器会回调该接口 
+     *  
+     * @param request 
+     * @return 
+     * @throws UnsupportedEncodingException 
+     */  
+    @PostMapping("/notify")  
+    public String notify(HttpServletRequest request) throws UnsupportedEncodingException {  
+        System.out.println("notify come");  
+        Response2WxPayServer response2WxPayServer = new Response2WxPayServer();  
+        ;  
+        // 读取 入参  
+        StringBuilder sb = new StringBuilder();  
+        try {  
+            BufferedReader br = new BufferedReader(  
+                    new InputStreamReader((ServletInputStream) request.getInputStream()));  
+            String line = null;  
+            while ((line = br.readLine()) != null) {  
+                sb.append(line);  
+            }  
+            System.out.println("request:" + sb);  
+        } catch (Exception e) {  
+            e.printStackTrace();  
+            System.out.println("微信支付回调读取入参发生异常.直接返回更新失败");  
+            response2WxPayServer.setReturn_code(Constants.FAIL);  
+            response2WxPayServer.setReturn_msg("unknown");  
+            return XmlUtils.toXml(response2WxPayServer);  
+        }  
+        XStream xStream = new XStream();  
+        xStream.alias("xml", WxNotifyBean.class);  
+        WxNotifyBean wxNotifyBean = (WxNotifyBean) xStream.fromXML(sb.toString());  
+        System.out.println("notify info:" + GsonUtils.object2Json(wxNotifyBean));  
+        if (null != wxNotifyBean && wxNotifyBean.getReturn_code().equals(Constants.SUCCESS)  
+                && wxNotifyBean.getResult_code().equals(Constants.SUCCESS)) {// 支付成功  
+            String result = PaymentController.updateALiPayOrderStatus(wxNotifyBean.getOut_trade_no());  
+            System.out.println("验证成功,去更新状态 \t订单号:" + wxNotifyBean.getOut_trade_no() + "来自微信支付,更新结果:" + result);  
+            BaseResponse baseResponse = GsonUtils.getGson().fromJson(result, BaseResponse.class);  
+            if (null != baseResponse && baseResponse.isSucceeded) {  
+                response2WxPayServer.setReturn_code(Constants.SUCCESS);  
+            } else {  
+                response2WxPayServer.setReturn_code(Constants.FAIL);  
+                response2WxPayServer.setReturn_msg("unknown");  
+            }  
+        } else {  
+            // 支付失败  
+            response2WxPayServer.setReturn_code(Constants.FAIL);  
+            response2WxPayServer.setReturn_msg("unknown");  
+        }  
+        return XmlUtils.toXml(response2WxPayServer);  
+    }  
+  
+    // https://pay.weixin.qq.com/wiki/doc/api/app/app.php?chapter=4_3 文档地址  
+    /** 
+     * 微信统一下单接口 
+     *  
+     * @param orderNumber 
+     * @return 
+     */  
+    public Return4AppWxPayBean wxUnifiedorder(String create_ip, RequestUnifiedOrderBean requestUnifiedOrderBean) {  
+        requestUnifiedOrderBean.setNonce_str(NumUtils.getRandomStringByDate());  
+        requestUnifiedOrderBean.setSign("");  
+        requestUnifiedOrderBean.setSpbill_create_ip(create_ip);  
+        HashMap<String, String> hashMap = getHashMap2SignFromRequestUnifiedOrderBean(requestUnifiedOrderBean);  
+        String sign = addSign(hashMap);  
+        if (null == sign) {  
+            return null;  
+        }  
+        requestUnifiedOrderBean.setSign(sign);  
+        String requestContent = XmlUtils.getXstream().toXML(requestUnifiedOrderBean);  
+        requestContent = requestContent.replaceAll("__", "_");// xstream  
+                                                                // 转换的时候会把单个下划线弄成两个,所以这里替换下  
+        String result = HttpUtils.doPost(WXUNIFIEDORDER_HTTPURL, requestContent);  
+        System.out.println("微信统一下单接口 返回结果:" + result);  
+        if (TextUtils.isEmpty(result)) {// 统一下单都失败了.直接返回null  
+            return null;  
+        }  
+        XStream xstream = XmlUtils.getXstream();  
+        xstream.alias("xml", ResponseUnifiedOrderBean.class);// xml对应ResponseUnifiedOrderBean的根节点的名字  
+        ResponseUnifiedOrderBean responseUnifiedOrderBean = (ResponseUnifiedOrderBean) xstream.fromXML(result);  
+        if (responseUnifiedOrderBean.getReturn_code().equals("SUCCESS")  
+                && responseUnifiedOrderBean.getResult_code().equals("SUCCESS")) {// 全为成功.则进行相应的处理  
+            // 分割线  
+            Return4AppWxPayBean return4AppWxPayBean = new Return4AppWxPayBean();  
+            return4AppWxPayBean.setNonceStr(responseUnifiedOrderBean.getNonce_str());  
+            return4AppWxPayBean.setPrepayId(responseUnifiedOrderBean.getPrepay_id());  
+            // return4AppWxPayBean.setSign(responseUnifiedOrderBean.getSign());  
+            return4AppWxPayBean.setTimeStamp("" + TimeUtils.getTime_Second());  
+            // 再次签名appid,partnerid等全部参数必须全小写  
+            HashMap<String, String> hashMap2Sign = getHashMap2SignFromReturn4AppWxPayBean(return4AppWxPayBean);  
+            String sign1 = addSign(hashMap2Sign);  
+            if (null == sign1) {  
+                return null;  
+            }  
+            return4AppWxPayBean.setSign(sign1);  
+            return return4AppWxPayBean;  
+        } else {  
+            return null;  
+        }  
+    }  
+  
+    /** 
+     * 从requestUnifiedOrderBean 拿到一个待签名的hashmap 
+     *  
+     * @param requestUnifiedOrderBean 
+     * @return 
+     */  
+    private HashMap<String, String> getHashMap2SignFromRequestUnifiedOrderBean(  
+            RequestUnifiedOrderBean requestUnifiedOrderBean) {  
+        HashMap<String, String> hashMap = new HashMap<>();  
+        hashMap.put("appid", requestUnifiedOrderBean.getAppid());  
+        hashMap.put("device_info", requestUnifiedOrderBean.getDevice_info());  
+        hashMap.put("mch_id", requestUnifiedOrderBean.getMch_id());  
+        hashMap.put("nonce_str", requestUnifiedOrderBean.getNonce_str());  
+        hashMap.put("notify_url", requestUnifiedOrderBean.getNotify_url());  
+        hashMap.put("spbill_create_ip", requestUnifiedOrderBean.getSpbill_create_ip());  
+        hashMap.put("trade_type", requestUnifiedOrderBean.getTrade_type());  
+        hashMap.put("body", requestUnifiedOrderBean.getBody());  
+        hashMap.put("total_fee", requestUnifiedOrderBean.getTotal_fee() + "");  
+        hashMap.put("out_trade_no", requestUnifiedOrderBean.getOut_trade_no());  
+        return hashMap;  
+    }  
+  
+    /** 
+     * 把信息从return4AppWxPayBean弄到hashmap里面 
+     *  
+     * @param return4AppWxPayBean 
+     * @return 
+     */  
+    private HashMap<String, String> getHashMap2SignFromReturn4AppWxPayBean(Return4AppWxPayBean return4AppWxPayBean) {  
+        HashMap<String, String> hashMap2Sign = new HashMap<>();  
+        hashMap2Sign.put("appid", return4AppWxPayBean.getAppId());  
+        hashMap2Sign.put("partnerid", return4AppWxPayBean.getPartnerId());  
+        hashMap2Sign.put("prepayid", return4AppWxPayBean.getPrepayId());  
+        hashMap2Sign.put("noncestr", return4AppWxPayBean.getNonceStr());  
+        hashMap2Sign.put("timestamp", return4AppWxPayBean.getTimeStamp());  
+        hashMap2Sign.put("package", "Sign=WXPay");  
+        return hashMap2Sign;  
+    }  
+  
+    /** 
+     * 对hashmap进行加签 
+     *  
+     * @param hashMap2Sign 
+     * @return 
+     */  
+    private String addSign(HashMap<String, String> hashMap2Sign) {  
+        String stringA2Sign = AlipayCore.createLinkString(hashMap2Sign);  
+        String stringSignTemp2Sign = stringA2Sign + "&key=" + API_KEY;  
+        String md5 = EncodeUtils.md5(stringSignTemp2Sign);  
+        if (null == md5) {// 签名失败 直接返回null  
+            return null;  
+        }  
+        String sign1 = md5.toUpperCase();  
+        return sign1;  
+    }  
+}  
+
+
+
+
+
+/**  
+    * 把数组所有元素排序，并按照“参数=参数值”的模式用“&”字符拼接成字符串 
+    * @param params 需要排序并参与字符拼接的参数组 
+    * @return 拼接后字符串 
+    */  
+   public static String createLinkString(Map<String, String> params) {  
+  
+       List<String> keys = new ArrayList<String>(params.keySet());  
+       Collections.sort(keys);  
+  
+       String prestr = "";  
+  
+       for (int i = 0; i < keys.size(); i++) {  
+           String key = keys.get(i);  
+           String value = params.get(key);  
+  
+           if (i == keys.size() - 1) {//拼接时，不包括最后一个&字符  
+               prestr = prestr + key + "=" + value;  
+           } else {  
+               prestr = prestr + key + "=" + value + "&";  
+           }  
+       }  
+  
+       return prestr;  
+   }  
